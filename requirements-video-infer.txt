@@ -1,0 +1,15 @@
+# Extra packages for the video-only inference path (tool/infer_video.py).
+# The core requirements.txt + docs/installation.md environment is still needed
+# for the model itself (torch, pytorch3d, manotorch, MANO assets).
+
+# hand detection: supplies the per-view bbox that POEM-v2 does not predict.
+# CPU-only, works on macOS/Linux. Optional: --bbox-backend npy|json|full
+# need no detector at all.
+mediapipe>=0.10.9
+
+# ffmpeg-based frame loader used by the released demo (.mkv). Optional:
+# --video-backend cv2 uses OpenCV instead.
+ffmpeg-python>=0.2.0
+
+# test runner for scripts/testing/run_test_matrix.sh
+pytest>=7.0
