@@ -66,6 +66,7 @@ New, all additive — no existing file was modified:
 | `scripts/testing/run_synthetic_smoke.sh` | end-to-end smoke: dry runs, then real inference if a checkpoint is given |
 | `tests/` | 121 test cases, tiered by what the machine can support |
 | `docs/video_inference.md` | usage, calibration formats, metrics, hardware |
+| `docs/pipeline_design.md` | how the pipeline is built and why: architecture, geometry, design decisions, test strategy |
 
 Differences from `tool/infer_hand.py`: any number/naming of views, calibration
 from several sources, pluggable detectors, no GUI, device flag, results written
@@ -201,4 +202,4 @@ python -m tool.infer_video --calib calib.json --video-dir CAP --hand-side rh \
 scripts/testing/run_test_matrix.sh [tier1|tier2|tier3|tier4]
 ```
 
-Details: `docs/video_inference.md`.
+Details: `docs/video_inference.md` (usage), `docs/pipeline_design.md` (design).

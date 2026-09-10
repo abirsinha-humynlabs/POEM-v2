@@ -8,6 +8,11 @@ camera serials, pickled calibration, precomputed hand masks, an on-screen
 viewer, and `cuda:0`. This document covers the generalised path added on top of
 it.
 
+For how that path is built and why — architecture, the crop/master-frame/
+mirroring geometry, design rationale and the test strategy — see
+[`pipeline_design.md`](pipeline_design.md). For current status and what is
+still pending, see [`../plan_of_action.md`](../plan_of_action.md).
+
 ---
 
 ## 1. What the model gives you
