@@ -280,6 +280,72 @@ Still open:
   returns nothing rather than erroring — check `frames_predicted` and
   `bbox_stats` in `report.json`, not just the exit code.
 
+## 5b. Narrow-baseline egocentric stereo (ZED) — measured 2026-09-13
+
+Running the pipeline on the ZED `left_eye`/`right_eye` captures
+(`validation-result/ZED/.../episode_*`) is a materially different problem from
+the released example data, and the outcome is worth recording.
+
+**The rig.** 1920x1080 @ 30 fps, rectified, identical left/right intrinsics
+(fx = fy = 1065.07), baseline **0.11986 m**. Note the ZED
+`calibration.json` stores that baseline under a key named `baseline_meters`
+while the value is in **millimetres** — `tool/zed_episode.py` converts it.
+Copying it through would place the second camera 120 m away.
+
+**What works.** Calibration passes `sanity_check()` with no warnings; MediaPipe
+finds the hand in both eyes on essentially every frame; crop consistency is
+~1e-13 px; the 2D skeleton visibly tracks the hand; and POEM's median wrist
+depth (0.31-0.34 m) agrees with the depth implied by raw stereo disparity
+(~0.32 m). So the plumbing and the metric scale are right.
+
+**What does not.** Every accuracy gate fails on the raw output:
+
+| metric | example data (3 cam) | episode_047 (ZED stereo) | gate |
+| --- | --- | --- | --- |
+| `reproj_px_mean` | 11.1 px | **71-96 px** | < 20 |
+| frames meeting the gate | 100/100 | **0/60** sampled | — |
+| joints behind the camera | none | **6-15 % of frames** | impossible |
+| bone-length std | 1.53 mm | 5.6-5.7 mm | < 6 |
+| wrist step p90 | 7.8 mm | 111-130 mm | < 50 |
+
+Three things were ruled out before blaming the model: flipping the baseline
+sign changes the error by ~5 px (48.7 -> 44.1), so the extrinsic convention is
+not wrong; the pair really is rectified (median vertical disparity 5.8 px); and
+the same code scores 11.1 px on the released rig. The cause is structural —
+POEM-v2 triangulates across views that *surround* the hand, and a ZED's two
+eyes are 12 cm apart facing the same direction, on egocentric imagery outside
+the training distribution.
+
+**One real bug this surfaced.** `MediaPipeBBoxProvider` fell back to whichever
+hand it found when the requested side was absent from a view. On two-hand
+footage each eye can then box a *different* hand and the model triangulates
+across them. `--bbox-strict-side` refuses the view instead: 77.2 -> 48.7 px.
+
+**Stabilisation recovers the physical properties.** Passing the output through
+[egocentric-hand-stabilisation](https://github.com/Maiemdiab/egocentric-hand-stabilisation)
+(`temporal_smooth.py` then `rigidify.py`) fixes every physical gate:
+
+| | bone-length std (rh/lh) | wrist step p90 (rh/lh) | verdict |
+| --- | --- | --- | --- |
+| POEM raw | 5.70 / 5.55 mm | 111.3 / 130.1 mm | FAIL |
+| + temporal_smooth | 5.56 / 5.38 mm | 87.5 / 88.4 mm | FAIL |
+| + rigidify | **0.43 / 0.66 mm** | **22.6 / 36.4 mm** | **PASS** |
+
+at the cost of ~5 % of rows dropped as unrigidifiable. `temporal_smooth`
+reports 58.4 % jitter reduction at zero lag; `rigidify` takes bone CV from
+36.7 % to 2.06 %. This makes the hand rigid, smooth and self-consistent — it
+does **not** recover pose accuracy the baseline never captured, so the raw
+reprojection number stays in each episode's `_poem_QUALITY.json` as the honest
+read on absolute accuracy.
+
+**Recommendation.** For egocentric hand 3D, a monocular egocentric method
+(WiLoR/HaMeR — what produced the existing `hand_pose_results`) or the ZED's own
+`depth_maps`/`disparity_maps` is the right tool. POEM-v2 wants a surround rig.
+
+**Throughput on this footage**: 0.234 s/frame per hand at 1920x1080 with
+MediaPipe boxes (vs 0.107 s/frame on the example data with precomputed boxes),
+so ~6 min per hand for a 1823-frame clip on an A10G.
+
 ## 6. Quick reference
 
 ```bash
