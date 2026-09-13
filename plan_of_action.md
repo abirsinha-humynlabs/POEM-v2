@@ -1,7 +1,9 @@
 # Plan of action — POEM-v2 hand keypoints from video only
 
 Working notes for picking this up later (or on another machine). Status as of
-**2026-09-10**, branch `feature/video-only-inference`.
+**2026-09-13**, branch `feature/video-only-inference`. Tiers 1-4 have now all been
+executed on a Linux + NVIDIA A10G box; the numbers below are measured, not
+estimated.
 
 **Goal:** 3D hand keypoints from RGB video alone — no depth, no IMU, no ground
 truth — with the code ready to run the moment a GPU box is available.
@@ -43,8 +45,9 @@ truth — with the code ready to run the moment a GPU box is available.
   `neural_renderer` is *not* on the inference path — so `--device cpu` runs, at
   seconds per frame. Good for plumbing checks, useless for video.
 * macOS/MPS is not a path: pytorch3d's `knn_points`/`ball_query` have no Metal
-  kernels. The current laptop has neither CUDA nor pytorch3d — hence the tiered
-  test design below.
+  kernels. The pipeline was written on a laptop with neither CUDA nor pytorch3d
+  — hence the tiered test design below, which is what let tiers 1-2 be proven
+  before a GPU box existed.
 
 ## 2. What is now in the repo
 
@@ -78,13 +81,18 @@ to disk, and a torch-free `--dry-run` validation mode.
 
 | tier | scope | needs | status |
 | --- | --- | --- | --- |
-| 1 | calibration, geometry, boxes, crops, video IO, dry-run pipeline, CLI | numpy + opencv + pytest | **90 passed, 1 skipped** on macOS, no GPU |
-| 2 | torch batch contract, DLT parity with the repo's implementation | CPU torch | **7 passed** on macOS |
-| 3 | model build + forward passes | pytorch3d, manotorch, `assets/mano_v1_2` | 9 passed (cfg/env/device), **8 pending** |
-| 4 | accuracy on the released example data | + `POEM_CHECKPOINT`, `POEM_EXAMPLE_DATA` | **6 pending** |
+| 1 | calibration, geometry, boxes, crops, video IO, dry-run pipeline, CLI | numpy + opencv + pytest | **91 passed, 0 skipped** (A10G box, 10.3 s) |
+| 2 | torch batch contract, DLT parity with the repo's implementation | CPU torch | **7 passed** (4.6 s) |
+| 3 | model build + forward passes | pytorch3d, manotorch, `assets/mano_v1_2` | **17 passed, 0 skipped** with `medium.pth.tar` (70 s) |
+| 4 | accuracy on the released example data | + `POEM_CHECKPOINT`, `POEM_EXAMPLE_DATA` | **6 passed, 0 skipped** (37.6 s) |
 
-Tiers 1-2 were run and pass on this laptop (`106 passed, 15 skipped` overall).
-Tiers 3-4 have never executed — that is the main open item.
+All four tiers now pass with no skips: **121 of 121 cases**. Measured on
+Linux + NVIDIA A10G (23 GB), Python 3.8.0, torch 1.11.0+cu113, pytorch3d 0.7.2,
+manotorch 0.0.2, mediapipe 0.10.9, checkpoint `medium.pth.tar`.
+
+Tier 1's previously-skipped case now runs (it needed mediapipe). Tier 3 without
+a checkpoint is 15 passed / 2 skipped; the 2 are the weight-load and
+metric-plausibility checks, which pass once `POEM_CHECKPOINT` is set.
 
 What tiers 1-2 already prove, against exact synthetic ground truth:
 
@@ -101,62 +109,133 @@ What tiers 1-2 already prove, against exact synthetic ground truth:
 * export: `keypoints.npz` / `keypoints.json` match ground truth to 1e-4 m
   through the whole pipeline, using an oracle predictor in place of the network.
 
-## 4. Pending — in order
+## 4. Done — with the measured numbers
 
-### A. Build the environment on a Linux + NVIDIA box
-Follow `docs/installation.md` (conda env, torch 1.11.0+cu113, cu113 pytorch3d,
-manotorch, MANO assets in `assets/mano_v1_2`, `sh prepare/download_hrnet.sh`),
-then `pip install -r requirements-video-infer.txt` for mediapipe/ffmpeg-python.
-Verify with:
+All of A-E below have been executed on a Linux + NVIDIA A10G box
+(2026-09-13). Commands are kept so they can be re-run.
 
+### A. Environment — built and verified ✅
 ```bash
 python -m tool.infer_video --env-report --out unused
+# missing: []   mano_assets: true   cuda: true   devices: [cpu, cuda:0]
 ```
+Python 3.8.0, torch 1.11.0+cu113, torchvision 0.12.0+cu113, pytorch3d 0.7.2,
+manotorch 0.0.2, numpy 1.23.5, opencv 4.5.3, mediapipe 0.10.9, on an
+NVIDIA A10G (23 GB).
 
-`missing` must be empty and `mano_assets` true.
+Four deviations from `docs/installation.md` were needed; none touches the
+inference path, and the pins in the doc are otherwise honoured:
 
-### B. Run tier 3 (model forward) — 8 cases
-```bash
-scripts/testing/run_test_matrix.sh tier3
-```
-Covers: 2-view and 3-view forwards, a 2-of-3-view (occlusion) forward, output
-shapes/finiteness, determinism, and the two mono guards — including
-`test_single_view_batch_needs_ground_truth`, which asserts the GT dependency of
-the single-view path rather than just describing it. Weights are random here, so
-values are meaningless by design; only structure is asserted.
+1. **conda-forge only.** `conda env create -f environment.yml` pulls the
+   `defaults` channel, which now refuses to install without an interactive
+   Anaconda Terms-of-Service acceptance. The env is built with the identical
+   package pins from conda-forge instead
+   (`conda create -n POEM --override-channels -c conda-forge python==3.8
+   "setuptools~=58.5" numpy==1.23.5 pip ipython pyembree`).
+2. **`opendr` omitted.** It fails to compile (`gcc`/`ld` error) and its failure
+   aborts the whole `pip install -r requirements.txt`. It is a legacy SMPL
+   renderer and is not imported anywhere on the inference path.
+3. **pytorch3d needs its deps from PyPI.** `pip install --no-index -f <wheel
+   url>` cannot resolve `fvcore`, so install `fvcore~=0.1.5 iopath` first and
+   then the wheel with `--no-deps`.
+4. **mediapipe pinned to 0.10.9.** `mediapipe>=0.10.9` resolves to 1.x, which
+   uses PEP-585 generics (`list[Category]`) and cannot be imported on Python
+   3.8; 0.10.11 additionally wants a `jaxlib` that has no 3.8 wheel.
 
-### C. Get the checkpoints and run tier 3's checkpoint cases
-Download from the README's `ckpt_release` Drive folder into `./checkpoints`, then
+`sh prepare/download_hrnet.sh` was not needed: `--reload` supplies all weights
+and `build_cfg()` blanks `BACKBONE.PRETRAINED`.
+
+### B/C. Tier 3 — 17 passed, 0 skipped ✅
 ```bash
 export POEM_CHECKPOINT=$PWD/checkpoints/medium.pth.tar
-scripts/testing/run_test_matrix.sh tier3
+scripts/testing/run_test_matrix.sh tier3        # 17 passed in 70 s
 ```
-Adds a strict weight-load check and a "output is metric and in front of the
-camera" check.
+Without a checkpoint: 15 passed, 2 skipped (the skips are exactly the
+weight-load and metric-plausibility cases). With `medium.pth.tar` the strict
+load reports `Loading SUCCEEDED` — every checkpoint tensor lands in the model
+(373.5 M parameters). Both mono guards pass, including
+`test_single_view_batch_needs_ground_truth`.
 
-### D. Run tier 4 on the released example data — 6 cases
-Download `example_data.tar.xz` from
-`https://huggingface.co/kelvin34501/POEM-v2_example_data`, extract, then
+Checkpoints came from the README's Drive folder via `gdown --folder`, which
+worked headlessly; all four (`small`, `medium`, `medium_MANO`, `large`) are in
+`./checkpoints/` (gitignored).
+
+### D. Tier 4 — 6 passed, 0 skipped ✅
 ```bash
-export POEM_EXAMPLE_DATA=/path/to/extracted/example_data
+export POEM_EXAMPLE_DATA=/path/to/example_data
 export POEM_CHECKPOINT=$PWD/checkpoints/medium.pth.tar
-scripts/testing/run_test_matrix.sh tier4        # add POEM_TEST_FRAMES=50 for more frames
+scripts/testing/run_test_matrix.sh tier4        # 6 passed in 37.6 s
 ```
-This is the real accuracy gate: 2D/3D agreement under 20 px, metric hand span
-(0.10-0.35 m), rigid bone lengths over time, wrist continuity under 5 cm/frame,
-the left-hand path on real imagery, a 2-view-vs-all-views MPJPE comparison
-(prints the number — **this is the answer to "how much do I lose with stereo?"**),
-and a MediaPipe-vs-shipped-boxes IoU check, which decides whether the
-detector-driven video-only path can replace the released mask pipeline.
 
-### E. Synthetic smoke with real weights
+Two test-side fixes were needed before this tier could run at all — neither
+relaxes a threshold:
+
+* the release now ships its sequences under **`data_v2/`**, not `data/`, so the
+  layout fixture accepts either;
+* the released clips **do not start with the hand in shot**. The mask pipeline
+  writes a file per frame but stores an empty array when it found nothing, so
+  `pour__2025_0325_1115_55` has < 2 boxed views until frame 11 and
+  `pour__2025_0325_1117_17` until frame 21. The tests sampled from frame 0 and
+  so measured the dead zone (0-9 usable frames). They now begin at the first
+  frame whose shipped boxes cover ≥ 2 views (`_first_usable_frame`), which
+  makes them *stricter* — more real frames are graded, against the same gates.
+
+Measured on `pour__2025_0325_1115_55`, 3 views, 100 frames from frame 11,
+`medium.pth.tar`:
+
+| metric | measured | gate | headroom |
+| --- | --- | --- | --- |
+| `reproj_px_mean` | **11.1 px** (p95 15.4) | < 20 px | 1.8× |
+| median hand span | **0.178 m** | 0.10-0.35 m | comfortably inside |
+| bone-length std over time | **1.53 mm** | < 6 mm | 3.9× |
+| wrist step, p90 | **7.8 mm/frame** | < 50 mm | 6.4× |
+| joint depth z | 0.57-0.81 m | trained 0-1.2 m | inside |
+| frames predicted | 100/100, 0 skipped | — | — |
+
+**2-view vs N-view (the stereo-rig question).** Over the same 100-frame window,
+camera_1+camera_2 against all three cameras:
+
+* **MPJPE 9.2 mm** (median 6.4, p95 27.8, max 52.7 mm)
+* the tier-4 test's own shorter 10-frame window prints **13.4 mm**
+* both runs are metric and stable; the 2-view run actually has a *lower*
+  `reproj_px_mean` (8.5 px vs 11.1 px), since reprojection error is averaged
+  over fewer, better-boxed views — it is an internal-consistency measure, not
+  an accuracy measure, and should not be read as "2 views are more accurate".
+
+**A stereo rig costs about 1 cm of joint accuracy** relative to a 3-camera rig
+on this footage. That is usable for most manipulation work; it is not
+negligible if you need sub-centimetre fingertips.
+
+**MediaPipe vs the shipped boxes: median IoU 0.60** over 12 view-frames
+(gate > 0.3). Good enough that the detector-driven, video-only path is a real
+replacement for the released mask pipeline — but 0.60 is agreement, not
+accuracy, and crop quality gates everything downstream, so check the overlay on
+your own footage.
+
+### E. Synthetic smoke with real weights — 3/3 cases ✅
 ```bash
 scripts/testing/run_synthetic_smoke.sh /tmp/poem_smoke checkpoints/medium.pth.tar medium
 ```
-Exercises stereo / 3-view-with-dropouts / left-hand end to end through the CLI
-and writes overlay videos. Cartoon imagery, so plumbing only.
+Stereo, 3-view-with-dropouts and left-hand all completed 10/10 frames, finite
+joints, `overlay.mp4` written, exit 0. `reproj_px_mean` is 36.8 / 51.7 / 40.0 px
+— high by design: the imagery is cartoon hands well off the training
+distribution, so this tier proves plumbing, not accuracy. Dry-run crop
+consistency is ~7e-14 px.
 
-### F. Then, on your own capture
+### F. Throughput on real hardware — measured ✅
+`pour__2025_0325_1115_55`, `medium.pth.tar`, A10G, 100 frames from frame 11:
+
+| views | frames | seconds | **s/frame** | fps | peak GPU mem |
+| --- | --- | --- | --- | --- | --- |
+| 3 (all) | 100/100 | 12.59 | **0.126** | 7.9 | 2709 MiB |
+| 2 (stereo) | 97/100 | 10.36 | **0.107** | 9.4 | 2709 MiB |
+
+So roughly **8-9 fps**, i.e. a 30 fps capture costs ~3.5-4× realtime, and
+GPU memory is a non-issue (< 3 GB of 23 GB) — batching frames would likely help
+more than a bigger GPU. Cost scales weakly with view count: +1 view is ~+18 %
+wall-clock, because per-view backbone work is a minority of the budget.
+
+### G. Then, on your own capture
 1. `python -m tool.make_calib stereo ... --out calib.json` (or `opencv` from
    your rectification work), then `make_calib check`.
 2. `python -m tool.infer_video --dry-run` — fix every calibration warning
@@ -166,23 +245,40 @@ and writes overlay videos. Cartoon imagery, so plumbing only.
 
 ## 5. Open questions / risks
 
-* **Stereo accuracy is unquantified.** Training mixes 2-8 views; a short-baseline
-  pair gives the weakest DLT seed. Step D's 2-view-vs-N-view MPJPE is the
-  measurement — run it before committing to a two-camera rig.
-* **Working volume.** `POSITION_RANGE` is x,y ∈ [-0.6, 0.6] m, z ∈ [0, 1.2] m
-  from the master camera; a rig framed further out is off-distribution.
+Resolved by measurement (2026-09-13):
+
+* **~~Stereo accuracy is unquantified.~~** Measured: **9.2 mm MPJPE** between a
+  2-view and a 3-view rig over 100 frames (13.4 mm on the test's shorter
+  window), both metric and temporally stable. A two-camera rig is viable;
+  budget ~1 cm of joint error against a three-camera one.
+* **~~Throughput is unmeasured.~~** Measured on an A10G: **0.126 s/frame at 3
+  views, 0.107 s/frame at 2 views** (7.9 / 9.4 fps), < 3 GB GPU memory.
+* **~~Left-hand path verified only synthetically.~~** Now also passes on the
+  released left-hand sequence (`pour__2025_0325_1117_17`) on real imagery.
+* **~~Detector quality is unproven.~~** Partially resolved: MediaPipe agrees
+  with the shipped boxes at **median IoU 0.60**, above the 0.3 gate. Still a
+  live risk on *your* footage — see below.
+
+Still open:
+
 * **Detector quality gates everything.** Crops come from the bbox, so a loose or
-  jittery detector degrades 3D without any error. Step D's IoU check is the
-  proxy; a hand-specific detector may beat MediaPipe on your footage.
+  jittery detector degrades 3D with no error raised. IoU 0.60 against the
+  released masks is agreement on easy, well-lit, hand-centred frames; a
+  hand-specific detector may beat MediaPipe on real captures. Always watch the
+  overlay.
+* **Working volume.** `POSITION_RANGE` is x,y ∈ [-0.6, 0.6] m, z ∈ [0, 1.2] m
+  from the master camera; a rig framed further out is off-distribution. The
+  example data sits at z ≈ 0.57-0.81 m, comfortably inside.
 * **Synchronisation.** Views are aligned by frame index only. Drift biases the
   3D silently — `check_alignment()` catches length/resolution/rate mismatches but
   cannot detect a constant temporal offset. Hardware-sync or verify externally.
 * **Two hands.** One hand per run; a two-hand capture means two passes with
   per-hand boxes (`--bbox-backend json`).
-* **Throughput** on real hardware is unmeasured (HRNet + a point transformer per
-  frame, per view). Measure with `--max-frames` before planning a long capture.
-* **Left-hand path on real data** has only been verified synthetically so far
-  (exactly, but synthetically) — step D covers it.
+* **A clip may not open with the hand in shot.** The released example data does
+  not, and neither will most real captures. Frames with < 2 boxed views are
+  skipped (correctly), but a run whose window lands entirely in a dead zone
+  returns nothing rather than erroring — check `frames_predicted` and
+  `bbox_stats` in `report.json`, not just the exit code.
 
 ## 6. Quick reference
 

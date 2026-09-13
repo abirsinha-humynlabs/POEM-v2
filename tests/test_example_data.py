@@ -19,7 +19,7 @@ Setup::
 
 Layout expected inside ``POEM_EXAMPLE_DATA`` (as shipped)::
 
-    data/<sequence>/<camera>.mkv
+    data/<sequence>/<camera>.mkv          (or data_v2/, as currently released)
     human_mask_hand/<sequence>/<camera>/bbox/%05d.npy
     calib/calib__*/cam_intr/<camera>.pkl,  .../cam_extr/<camera>.pkl
     hand_labels.json
@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 
 from conftest import CHECKPOINT, EXAMPLE_DATA, requires_checkpoint, requires_example_data
+from tool.poemkit.bbox import NpyBBoxProvider
 from tool.poemkit.calib import load_poem_pkl_calib
 from tool.poemkit.render import HAND_BONES
 
@@ -45,7 +46,12 @@ pytestmark = [requires_example_data, pytest.mark.realdata]
 @pytest.fixture(scope="module")
 def example_layout():
     root = EXAMPLE_DATA
-    data_dir = os.path.join(root, "data")
+    # the released tarball has shipped the sequences under both "data" and
+    # (currently) "data_v2"; accept whichever this copy actually has.
+    data_dir = next(
+        (os.path.join(root, name) for name in ("data", "data_v2") if os.path.isdir(os.path.join(root, name))),
+        os.path.join(root, "data"),
+    )
     mask_dir = os.path.join(root, "human_mask_hand")
     calib_dirs = sorted(glob.glob(os.path.join(root, "calib", "calib__*")))
     labels_path = os.path.join(root, "hand_labels.json")
@@ -91,6 +97,25 @@ def _sequence_inputs(layout, sequence):
     return rig.subset(list(videos)), videos, os.path.join(layout["mask_dir"], sequence), hand_side
 
 
+def _first_usable_frame(bbox_root, cameras, num_frames=600, min_views=2):
+    """First frame whose *shipped* boxes cover ``min_views`` cameras.
+
+    The released clips do not begin with the hand in shot. The mask pipeline
+    still writes a file for those frames, but it holds an empty array, so the
+    opening frames of a sequence can have fewer than two boxed views and are
+    skipped by the runner. Starting a measurement at frame 0 would therefore
+    grade the dead zone at the head of the clip rather than the model. Returns
+    0 when nothing better is found, leaving the caller's own assertions to fail
+    loudly rather than silently measuring nothing.
+    """
+    provider = NpyBBoxProvider(bbox_root)
+    for frame_id in range(num_frames):
+        boxed = sum(1 for cam in cameras if provider.get(cam, frame_id) is not None)
+        if boxed >= min_views:
+            return frame_id
+    return 0
+
+
 def test_layout_and_calibration(example_layout):
     rig = load_poem_pkl_calib(example_layout["calib_dir"])
     assert len(rig) >= 2, "the released rig should have several cameras"
@@ -115,6 +140,7 @@ def test_dry_run_over_a_real_sequence(example_layout, tmp_path):
         bbox_backend="npy",
         bbox_root=bbox_root,
         dry_run=True,
+        frame_start=_first_usable_frame(bbox_root, rig.names),
         max_frames=MAX_FRAMES,
         progress=False,
     )
@@ -143,6 +169,7 @@ def test_inference_is_metric_and_temporally_stable(example_layout, tmp_path):
         bbox_backend="npy",
         bbox_root=bbox_root,
         predictor=runner,
+        frame_start=_first_usable_frame(bbox_root, rig.names),
         max_frames=MAX_FRAMES,
         progress=False,
     )
@@ -194,6 +221,7 @@ def test_left_hand_sequence_if_present(example_layout, tmp_path):
 
     report = run_sequence(rig=rig, video_paths=videos, out_dir=str(tmp_path / "lh"), hand_side=hand_side,
                           bbox_backend="npy", bbox_root=bbox_root, predictor=runner,
+                          frame_start=_first_usable_frame(bbox_root, rig.names),
                           max_frames=min(MAX_FRAMES, 10), progress=False)
     assert report["frames_predicted"] > 0
     assert report["reproj_px_mean"] < 25.0
@@ -218,14 +246,19 @@ def test_view_count_changes_the_answer_but_not_the_scale(example_layout, tmp_pat
     size = next((s for s in ("small", "medium", "large", "huge") if s in CHECKPOINT), "medium")
     runner = PoemRunner(cfg_path=CFG, checkpoint=CHECKPOINT, model_size=size, device="auto", verbose=False)
 
+    pair_names = rig.names[:2]
+    # both runs must start where the *pair* is usable, so they cover the same
+    # frames; the 2-view subset is the stricter of the two.
+    start = _first_usable_frame(bbox_root, pair_names)
+
     full = run_sequence(rig=rig, video_paths=videos, out_dir=str(tmp_path / "all"), hand_side=hand_side,
                         bbox_backend="npy", bbox_root=bbox_root, predictor=runner,
-                        max_frames=min(MAX_FRAMES, 10), progress=False)
+                        frame_start=start, max_frames=min(MAX_FRAMES, 10), progress=False)
 
-    pair_names = rig.names[:2]
     pair = run_sequence(rig=rig.subset(pair_names), video_paths={n: videos[n] for n in pair_names},
                         out_dir=str(tmp_path / "pair"), hand_side=hand_side, bbox_backend="npy",
-                        bbox_root=bbox_root, predictor=runner, max_frames=min(MAX_FRAMES, 10), progress=False)
+                        bbox_root=bbox_root, predictor=runner, frame_start=start,
+                        max_frames=min(MAX_FRAMES, 10), progress=False)
 
     assert full["frames_predicted"] > 0 and pair["frames_predicted"] > 0
     a = np.load(os.path.join(str(tmp_path / "all"), "keypoints.npz"))
@@ -254,8 +287,9 @@ def test_mediapipe_boxes_agree_with_the_shipped_boxes(example_layout):
     detector = MediaPipeBBoxProvider(hand_side=hand_side)
 
     ious = []
+    start = _first_usable_frame(bbox_root, rig.names)
     with MultiViewReader(videos, backend="auto") as reader:
-        for frame_id in range(0, min(reader.num_frame, 10)):
+        for frame_id in range(start, min(reader.num_frame, start + 10)):
             frames = reader.read(frame_id)
             for cam, frame in frames.items():
                 ref = shipped.get(cam, frame_id)
