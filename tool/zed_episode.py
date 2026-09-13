@@ -26,6 +26,9 @@ import os
 
 import numpy as np
 
+# a joint must be at least this far in front of the master camera to be real
+Z_MIN_M = 0.05
+
 
 def _K(block):
     return np.array([[block["fx"], 0.0, block["cx"]],
@@ -79,22 +82,39 @@ def convert(npz_paths, calib_path: str, out_path: str, master: str = "left_eye")
     K = np.asarray(cam["K"], dtype=np.float64)
 
     frame_idx, kp2d, kp3d = [], [], []
+    dropped = {}
     for path in npz_paths:
         if not os.path.isfile(path):
             print("  skip (absent): %s" % path)
             continue
         d = np.load(path)
         joints = d["joints_master"]            # (F, 21, 3) meters, master frame
+        ids = np.asarray(d["frame_ids"], dtype=np.int64)
         if joints.size == 0:
             print("  skip (empty): %s" % path)
             continue
+
+        # Drop detections with any joint at or behind the image plane. They are
+        # physically impossible, and projecting them would divide by a
+        # non-positive depth and emit coordinates millions of pixels off frame,
+        # which would poison the renderer's tracker rather than simply be wrong.
+        valid = joints[..., 2].min(axis=1) > Z_MIN_M
+        n_drop = int((~valid).sum())
+        joints, ids = joints[valid], ids[valid]
+        if joints.size == 0:
+            print("  skip (no physically valid detection): %s" % path)
+            dropped[os.path.basename(os.path.dirname(path))] = n_drop
+            continue
+
         # project into the FULL master frame -- the renderer draws on left_eye.mp4
         uvw = joints @ K.T
-        uv = uvw[..., :2] / np.clip(uvw[..., 2:3], 1e-6, None)
-        frame_idx.append(np.asarray(d["frame_ids"], dtype=np.int64))
+        uv = uvw[..., :2] / uvw[..., 2:3]
+        frame_idx.append(ids)
         kp2d.append(uv.astype(np.float32))
         kp3d.append(joints.astype(np.float32))
-        print("  + %-48s %d detections" % (os.path.basename(os.path.dirname(path)), len(d["frame_ids"])))
+        dropped[os.path.basename(os.path.dirname(path))] = n_drop
+        print("  + %-6s %5d detections kept, %4d dropped (joint at/behind camera)"
+              % (os.path.basename(os.path.dirname(path)), len(ids), n_drop))
 
     if not frame_idx:
         raise SystemExit("no usable keypoints in: %s" % ", ".join(npz_paths))
@@ -106,8 +126,9 @@ def convert(npz_paths, calib_path: str, out_path: str, master: str = "left_eye")
 
     np.savez_compressed(out_path, frame_idx=frame_idx[order], kp2d=kp2d[order],
                         kp3d_cam=kp3d[order], K=K.astype(np.float32))
-    print("wrote %s: %d detections over frames %d..%d"
-          % (out_path, len(frame_idx), frame_idx.min(), frame_idx.max()))
+    print("wrote %s: %d detections over frames %d..%d (dropped %d behind camera: %s)"
+          % (out_path, len(frame_idx), frame_idx.min(), frame_idx.max(),
+             sum(dropped.values()), dropped))
 
 
 def main():
