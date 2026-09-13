@@ -164,3 +164,7 @@ ali_pose*/**
 venvs/**
 assets/mano_v1_2
 *.tar
+# scratch: ZED episode working dirs and the viz_delivery drop fetched from S3
+/viz_delivery/
+/zed_work/
+/zed_trial/

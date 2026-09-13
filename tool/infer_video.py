@@ -135,6 +135,7 @@ def run_sequence(
     bbox_root: Optional[str] = None,
     bbox_json: Optional[str] = None,
     bbox_max_age: int = 5,
+    bbox_strict_side: bool = False,
     predictor=None,
     dry_run: bool = False,
     video_backend: str = "auto",
@@ -151,6 +152,7 @@ def run_sequence(
     overlay: bool = False,
     overlay_scale: float = 0.5,
     overlay_fps: float = 30.0,
+    overlay_views: Optional[Sequence[str]] = None,
     progress: bool = True,
 ) -> Dict:
     """Process one synchronised multi-view sequence.
@@ -185,6 +187,7 @@ def run_sequence(
         hand_side=hand_side,
         image_size=first_size,
         max_age=bbox_max_age,
+        strict_side=bbox_strict_side,
     )
 
     idxs = frame_indices(reader.num_frame, frame_start, frame_end, frame_step, max_frames)
@@ -248,7 +251,7 @@ def run_sequence(
                 records.append(record)
 
                 if writer is not None:
-                    writer.write_bgr(_overlay_frame(frames, packet, rig, out, overlay_scale))
+                    writer.write_bgr(_overlay_frame(frames, packet, rig, out, overlay_scale, overlay_views))
 
             if progress and (n_done % 50 == 0 or n_done == len(idxs) - 1):
                 elapsed = time.time() - t_start
@@ -320,17 +323,27 @@ def _crop_consistency(packet, rig) -> float:
     return worst
 
 
-def _overlay_frame(frames, packet, rig, out, scale):
+def _overlay_frame(frames, packet, rig, out, scale, views=None):
+    """Draw the reprojected skeleton on each view and tile them.
+
+    ``views`` restricts the overlay to a subset of the cameras (order kept),
+    so a stereo run can be reviewed as a single eye rather than a side-by-side
+    pair. Inference still uses every view; this only changes what is drawn.
+    """
     import cv2
 
     from tool.poemkit.render import draw_hand_2d, tile_views
 
+    names = [n for n in packet.names if n in set(views)] if views else list(packet.names)
+    if not names:  # the requested view is not in this frame's packet
+        names = list(packet.names)
+
     tiles = []
-    proj = project_to_views(out["joints_world"], rig, packet.names)
-    for name in packet.names:
+    proj = project_to_views(out["joints_world"], rig, names)
+    for name in names:
         img = cv2.cvtColor(frames[name], cv2.COLOR_RGB2BGR)
         tiles.append(draw_hand_2d(img, proj[name]))
-    return tile_views(tiles, scale=scale, labels=packet.names)
+    return tile_views(tiles, scale=scale, labels=names)
 
 
 def _write_outputs(out_dir: str, records: List[Dict], report: Dict, save_verts: bool, dry_run: bool):
@@ -403,6 +416,10 @@ def build_parser() -> argparse.ArgumentParser:
     hand.add_argument("--bbox-root", type=str, default=None, help="for --bbox-backend npy: <root>/<cam>/bbox/%%05d.npy")
     hand.add_argument("--bbox-json", type=str, default=None, help="for --bbox-backend json")
     hand.add_argument("--bbox-max-age", type=int, default=5, help="frames a stale box may be reused (0 disables)")
+    hand.add_argument("--bbox-strict-side", action="store_true",
+                      help="mediapipe only: if the requested hand is not found in a view, drop that "
+                           "view instead of falling back to the other hand. Use on two-hand footage "
+                           "(egocentric video), where the fallback can box a different hand per view.")
     hand.add_argument("--bbox-expand", type=float, default=2.0)
     hand.add_argument("--bbox-mindim", type=float, default=200.0)
 
@@ -426,6 +443,9 @@ def build_parser() -> argparse.ArgumentParser:
     rng.add_argument("--out", "-o", type=str, required=True, help="output directory")
     rng.add_argument("--save-verts", action="store_true", help="also store the 778 mesh vertices per frame")
     rng.add_argument("--overlay", action="store_true", help="write overlay.mp4 with reprojected joints")
+    rng.add_argument("--overlay-views", type=str, default=None,
+                     help="comma-separated cameras to draw in overlay.mp4 (default: all). "
+                          "Inference still uses every view.")
     rng.add_argument("--overlay-scale", type=float, default=0.5)
     rng.add_argument("--overlay-fps", type=float, default=30.0)
 
@@ -485,6 +505,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bbox_root=args.bbox_root,
         bbox_json=args.bbox_json,
         bbox_max_age=args.bbox_max_age,
+        bbox_strict_side=args.bbox_strict_side,
         predictor=predictor,
         dry_run=args.dry_run,
         video_backend=args.video_backend,
@@ -498,6 +519,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bbox_mindim=args.bbox_mindim,
         save_verts=args.save_verts,
         overlay=args.overlay,
+        overlay_views=[v.strip() for v in args.overlay_views.split(",") if v.strip()]
+        if args.overlay_views else None,
         overlay_scale=args.overlay_scale,
         overlay_fps=args.overlay_fps,
     )

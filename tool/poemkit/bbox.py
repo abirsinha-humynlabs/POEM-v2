@@ -142,6 +142,12 @@ class MediaPipeBBoxProvider(BBoxProvider):
     into metric 3D. Optional dependency -- ``pip install mediapipe``. The
     landmarks are also returned via :attr:`last_landmarks` so they can be
     stored next to the POEM output for comparison.
+
+    ``strict_side`` decides what happens when the requested hand is not found
+    in a view. The default (False) falls back to whichever hand was detected,
+    which is right for a single-hand capture. Set it for footage where both
+    hands are visible -- egocentric video especially -- so a view is dropped
+    rather than filled with the other hand.
     """
 
     name = "mediapipe"
@@ -154,6 +160,7 @@ class MediaPipeBBoxProvider(BBoxProvider):
         min_tracking_confidence: float = 0.4,
         pad_ratio: float = 0.25,
         prefer_side: bool = True,
+        strict_side: bool = False,
     ):
         try:
             import mediapipe as mp
@@ -163,6 +170,7 @@ class MediaPipeBBoxProvider(BBoxProvider):
         self._mp = mp
         self.hand_side = hand_side
         self.prefer_side = prefer_side
+        self.strict_side = strict_side
         self.pad_ratio = pad_ratio
         # one graph per camera: MediaPipe Hands is stateful across frames
         self._solvers: Dict[str, object] = {}
@@ -198,6 +206,14 @@ class MediaPipeBBoxProvider(BBoxProvider):
                     chosen = lm
                     break
         if chosen is None:
+            if self.strict_side:
+                # Two-hand footage: substituting the other hand here would box a
+                # *different* hand in each view, and the model would triangulate
+                # across them -- geometrically consistent nonsense that shows up
+                # only as a large reprojection error. Refuse the view instead;
+                # the frame survives if another view still has the wanted hand,
+                # and is skipped otherwise.
+                return None
             chosen = result.multi_hand_landmarks[0]
 
         pts = np.array([[p.x * w, p.y * h] for p in chosen.landmark], dtype=np.float32)
@@ -270,6 +286,7 @@ def build_bbox_provider(
     hand_side: str = "rh",
     image_size: Optional[Sequence[int]] = None,
     max_age: int = 5,
+    strict_side: bool = False,
 ) -> BBoxTracker:
     """Factory used by the CLI; always returns a tracker-wrapped provider."""
     backend = backend.lower()
@@ -282,7 +299,7 @@ def build_bbox_provider(
             raise ValueError("backend 'json' requires --bbox-json")
         provider = JsonBBoxProvider(bbox_json)
     elif backend == "mediapipe":
-        provider = MediaPipeBBoxProvider(hand_side=hand_side)
+        provider = MediaPipeBBoxProvider(hand_side=hand_side, strict_side=strict_side)
     elif backend == "full":
         provider = FullFrameBBoxProvider(image_size=image_size)
     else:
