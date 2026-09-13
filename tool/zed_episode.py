@@ -81,7 +81,7 @@ def convert(npz_paths, calib_path: str, out_path: str, master: str = "left_eye")
     cam = next(c for c in rig["cameras"] if c["name"] == master)
     K = np.asarray(cam["K"], dtype=np.float64)
 
-    frame_idx, kp2d, kp3d = [], [], []
+    frame_idx, kp2d, kp3d, source, hand, kept = [], [], [], [], [], []
     dropped = {}
     for path in npz_paths:
         if not os.path.isfile(path):
@@ -109,10 +109,18 @@ def convert(npz_paths, calib_path: str, out_path: str, master: str = "left_eye")
         # project into the FULL master frame -- the renderer draws on left_eye.mp4
         uvw = joints @ K.T
         uv = uvw[..., :2] / uvw[..., 2:3]
+        side = os.path.basename(os.path.dirname(path))      # "rh" / "lh"
         frame_idx.append(ids)
         kp2d.append(uv.astype(np.float32))
         kp3d.append(joints.astype(np.float32))
-        dropped[os.path.basename(os.path.dirname(path))] = n_drop
+        # "fused": POEM-v2 fuses two calibrated views, and the boxes come from
+        # MediaPipe. Both downstream consumers key off this -- the wrist-trajectory
+        # renderer treats anything that is not fused/lifted_2d as unsupported and
+        # can drop the track, and the stabiliser weights rows by source.
+        source.append(np.full(len(ids), "fused", dtype=object))
+        hand.append(np.full(len(ids), 0 if side == "lh" else 1, dtype=np.int64))
+        kept.append(np.ones(len(ids), dtype=bool))
+        dropped[side] = n_drop
         print("  + %-6s %5d detections kept, %4d dropped (joint at/behind camera)"
               % (os.path.basename(os.path.dirname(path)), len(ids), n_drop))
 
@@ -124,8 +132,17 @@ def convert(npz_paths, calib_path: str, out_path: str, master: str = "left_eye")
     kp3d = np.concatenate(kp3d)
     order = np.argsort(frame_idx, kind="stable")   # renderer walks frames forward
 
+    source = np.concatenate(source).astype(str)
+    hand = np.concatenate(hand)
+    kept = np.concatenate(kept)
     np.savez_compressed(out_path, frame_idx=frame_idx[order], kp2d=kp2d[order],
-                        kp3d_cam=kp3d[order], K=K.astype(np.float32))
+                        kp3d_cam=kp3d[order], K=K.astype(np.float32),
+                        source=source[order], hand=hand[order], kept=kept[order],
+                        # The stabiliser's rigidify pass estimates one canonical
+                        # bone-length template per side from this field. The name is
+                        # WiLoR-era; what it wants is the detector's raw per-frame 3D
+                        # hand, which for us is exactly POEM's unsmoothed output.
+                        kp3d_cam_wilor_raw=kp3d[order])
     print("wrote %s: %d detections over frames %d..%d (dropped %d behind camera: %s)"
           % (out_path, len(frame_idx), frame_idx.min(), frame_idx.max(),
              sum(dropped.values()), dropped))
